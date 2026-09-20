@@ -5,9 +5,12 @@
 #include <QFileInfo>
 #include <QMimeDatabase>
 #include <QMimeType>
+#include <QMap>
+#include <QSaveFile>
 #include <QProcess>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QTextStream>
 #include <algorithm>
 
 namespace atlas::core {
@@ -203,6 +206,96 @@ void MimeService::openWith(const QString& filePath, const QString& desktopFilePa
     QProcess::startDetached(program, args);
 }
 
+namespace {
+struct MimeappsData {
+    QStringList sections;
+    QMap<QString, QStringList> keyOrder;
+    QMap<QString, QMap<QString, QString>> values;
+
+    QString value(const QString& section, const QString& key) const {
+        return values.value(section).value(key);
+    }
+    void set(const QString& section, const QString& key, const QString& val) {
+        if (!values.contains(section)) {
+            sections.append(section);
+            keyOrder[section] = {};
+            values[section] = {};
+        }
+        if (!values[section].contains(key)) keyOrder[section].append(key);
+        values[section][key] = val;
+    }
+    void unset(const QString& section, const QString& key) {
+        if (!values.contains(section) || !values[section].contains(key)) return;
+        values[section].remove(key);
+        keyOrder[section].removeAll(key);
+    }
+};
+
+bool isMangledSection(const QString& name) {
+    return name == QStringLiteral("Added%20Associations")
+        || name == QStringLiteral("Default%20Applications");
+}
+
+MimeappsData parseMimeapps(const QString& filePath) {
+    MimeappsData data;
+    QFile f(filePath);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return data;
+    QString section;
+    QTextStream in(&f);
+    while (!in.atEnd()) {
+        const QString t = in.readLine().trimmed();
+        if (t.startsWith('[') && t.endsWith(']')) {
+            section = t.mid(1, t.size() - 2).trimmed();
+            if (isMangledSection(section)) {
+                section.clear();
+                continue;
+            }
+            if (!data.values.contains(section)) {
+                data.sections.append(section);
+                data.keyOrder[section] = {};
+                data.values[section] = {};
+            }
+            continue;
+        }
+        if (section.isEmpty() || t.isEmpty() || t.startsWith('#') || t.startsWith(';')) continue;
+        const int eq = t.indexOf('=');
+        if (eq <= 0) continue;
+        const QString key = t.left(eq).trimmed();
+        if (!data.values[section].contains(key)) data.keyOrder[section].append(key);
+        data.values[section][key] = t.mid(eq + 1).trimmed();
+    }
+    return data;
+}
+
+bool writeMimeapps(const QString& filePath, const MimeappsData& data) {
+    QString target = filePath;
+    const QString canonical = QFileInfo(filePath).canonicalFilePath();
+    if (!canonical.isEmpty()) target = canonical;
+    const QFile::Permissions perms = QFile::permissions(target);
+    QSaveFile f(target);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        qWarning() << "Atlas: cannot write" << target;
+        return false;
+    }
+    QTextStream out(&f);
+    bool first = true;
+    for (const QString& section : data.sections) {
+        if (!first) out << '\n';
+        first = false;
+        out << '[' << section << "]\n";
+        for (const QString& key : data.keyOrder.value(section)) {
+            out << key << '=' << data.values.value(section).value(key) << '\n';
+        }
+    }
+    if (perms != QFile::Permissions()) f.setPermissions(perms);
+    if (!f.commit()) {
+        qWarning() << "Atlas: failed to commit" << target;
+        return false;
+    }
+    return true;
+}
+} // namespace
+
 void MimeService::setDefaultApp(const QString& mimeType, const QString& desktopFileName) {
     if (mimeType.isEmpty() || desktopFileName.isEmpty()) return;
 
@@ -211,29 +304,38 @@ void MimeService::setDefaultApp(const QString& mimeType, const QString& desktopF
         cleanId = QFileInfo(cleanId).fileName();
     }
 
-    // Update mimeapps.list directly according to XDG Desktop Entry Specification
     QString configDir = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
-    if (!configDir.isEmpty()) {
-        QDir().mkpath(configDir);
-        QString mimeAppsPath = configDir + "/mimeapps.list";
+    if (configDir.isEmpty()) return;
+    QDir().mkpath(configDir);
 
-        QSettings settings(mimeAppsPath, QSettings::IniFormat);
-        settings.beginGroup("Default Applications");
-        settings.setValue(mimeType, cleanId);
-        settings.endGroup();
-
-        settings.beginGroup("Added Associations");
-        QString currentAdded = settings.value(mimeType).toString();
-        QStringList addedList = currentAdded.split(';', Qt::SkipEmptyParts);
-        addedList.removeAll(cleanId);
-        addedList.prepend(cleanId);
-        settings.setValue(mimeType, addedList.join(';') + ";");
-        settings.endGroup();
-        settings.sync();
+    const QString desktop = QString::fromUtf8(qgetenv("XDG_CURRENT_DESKTOP")).toLower();
+    if (!desktop.isEmpty()) {
+        const QString shadow = configDir + "/" + desktop + "-mimeapps.list";
+        if (QFile::exists(shadow) && QFileInfo(shadow).size() > 0) {
+            qWarning() << "Atlas: per-desktop associations file shadows mimeapps.list:" << shadow;
+        }
     }
 
-    // Also invoke xdg-mime default
-    QProcess::startDetached("xdg-mime", QStringList{ "default", cleanId, mimeType });
+    const QString mimeAppsPath = configDir + "/mimeapps.list";
+    MimeappsData data = parseMimeapps(mimeAppsPath);
+
+    QStringList defList = data.value("Default Applications", mimeType).split(';', Qt::SkipEmptyParts);
+    defList.removeAll(cleanId);
+    defList.prepend(cleanId);
+    data.set("Default Applications", mimeType, defList.join(';'));
+
+    QStringList addedList = data.value("Added Associations", mimeType).split(';', Qt::SkipEmptyParts);
+    addedList.removeAll(cleanId);
+    addedList.prepend(cleanId);
+    data.set("Added Associations", mimeType, addedList.join(';') + ";");
+
+    QStringList removedList = data.value("Removed Associations", mimeType).split(';', Qt::SkipEmptyParts);
+    if (removedList.removeAll(cleanId) > 0) {
+        if (removedList.isEmpty()) data.unset("Removed Associations", mimeType);
+        else data.set("Removed Associations", mimeType, removedList.join(';') + ";");
+    }
+
+    writeMimeapps(mimeAppsPath, data);
 }
 
 } // namespace atlas::core
